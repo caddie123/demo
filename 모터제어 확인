@@ -1,0 +1,34 @@
+카메라 작동 확인
+rostopic list | grep camera
+
+사람 인식 확인
+rostopic echo /depth_and_deg
+
+카메라 토픽 확인
+
+rostopic list
+rostopic echo /camera/color/image_raw
+rostopic echo /camera/depth/image_raw
+
+카메라 영상 확인
+rqt_image_view
+
+카메라 토픽 없으면 개별 실행
+roslaunch realsense2_camera rs_camera.launch
+
+
+탐지 임계값 낮추기
+pred = non_max_suppression(pred, 0.5, 0.45, classes=[0], max_det=1000)
+
+
+
+yolo인식되면 cmd_vel 확인
+rostopic echo /cmd_vel
+
+최후 make 다시하고 권한 부여
+cd ~/catkin_ws
+catkin_make
+source devel/setup.bash
+
+chmod +x ~/catkin_ws/src/robot_ctrl/scripts/human_follower.py
+
