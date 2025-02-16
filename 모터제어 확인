@@ -1,3 +1,9 @@
+Arduino 코드 업로드 (최초 1회)
+arduino-cli upload -p /dev/ttyACM0 --fqbn arduino:avr:mega2560 ~/Arduino_Code/motor_driver_rs232.ino
+ROS 실행
+source ~/catkin_ws/devel/setup.bash
+roscore
+
 카메라 작동 확인
 rostopic list | grep camera
 
