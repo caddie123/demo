@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>robot_ctrl</name>
+  <version>0.0.0</version>
+  <description>The robot_ctrl package</description>
+
+  <maintainer email="amr@todo.todo">amr</maintainer>
+  <license>TODO</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- 메시지 생성을 위한 의존성 -->
+  <build_depend>message_generation</build_depend>
+  <build_depend>roscpp</build_depend>
+  <build_depend>rospy</build_depend>
+  <build_depend>sensor_msgs</build_depend>
+  <build_depend>std_msgs</build_depend>
+  <build_depend>yolov5_ros</build_depend>
+  <build_depend>message_filters</build_depend>
+  <build_depend>cv_bridge</build_depend>
+  <build_depend>nav_msgs</build_depend>
+
+  <depend>realsense2_description</depend>
+  <depend>tf</depend>
+  <depend>robot_state_publisher</depend>
+  <depend>rviz</depend>
+  <depend>geometry_msgs</depend>
+
+  <build_export_depend>roscpp</build_export_depend>
+  <build_export_depend>rospy</build_export_depend>
+  <build_export_depend>sensor_msgs</build_export_depend>
+  <build_export_depend>std_msgs</build_export_depend>
+  <build_export_depend>yolov5_ros</build_export_depend>
+  <build_export_depend>cv_bridge</build_export_depend>
+  <build_export_depend>message_filters</build_export_depend>
+  <build_export_depend>nav_msgs</build_export_depend>
+
+  <exec_depend>roscpp</exec_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>yolov5_ros</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>message_filters</exec_depend>  
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>message_runtime</exec_depend>
+  
+  <export>
+  </export>
+</package>
+
