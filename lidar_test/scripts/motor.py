@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 import rospy
 import serial
-import re
 import threading
-from sensor_msgs.msg import PointCloud2
 import sensor_msgs.point_cloud2 as pc2
+from sensor_msgs.msg import PointCloud2
 
 # 🚀 MoonWalker 모터 드라이버 시리얼 포트 설정
 try:
@@ -17,20 +16,24 @@ except serial.SerialException:
 # 🎯 ROS 노드 초기화
 rospy.init_node('motor_driver')
 
-# 🚧 장애물 감지 거리(원래 0.5~0.6m 설정)
-OBSTACLE_MIN_DIST = 0.5
-OBSTACLE_MAX_DIST = 0.6
-
-# → 하지만 hysteresis를 위해 새 임계값 정의
-STOP_THRESHOLD = 0.65   # 이 값 이하이면 모터 정지
-START_THRESHOLD = 0.95  # 이 값 이상이면 모터 재시작
+# 🚧 장애물 감지 임계값 (회피 시작: 1.0m ~ 1.2m)
+OBSTACLE_MIN_DIST = 1.3
+OBSTACLE_MAX_DIST = 1.5
 
 # 🚀 기본 이동 속도 (0.3m/s)
 DEFAULT_SPEED = 0.3
-MOVING = False             # 현재 로봇이 움직이고 있는지 여부
-OBSTACLE_DETECTED = False  # 장애물 감지 상태
+# 전진 명령: (오른쪽 바퀴 +, 왼쪽 바퀴 -) → "mvc=21,-21" (예)
+FORWARD_COMMAND = "mvc=21,-21\r\n"
+# 회피(오른쪽 회전) 명령: (오른쪽 바퀴 +, 왼쪽 바퀴 덜 역회전) → "mvc=21,-10\r\n"
+TURN_RIGHT_COMMAND = "mvc=21,-10\r\n"
 
-# 🛑 모터 정지 함수: 모터에 "mvc=0,0" 전송
+MOVING = False
+OBSTACLE_DETECTED = False
+avoidance_mode = False
+avoidance_start_time = None
+avoidance_duration = 0.7  # 회피 명령 지속 시간 (초)
+
+# 🛑 모터 정지 함수
 def stop_motors():
     global MOVING, OBSTACLE_DETECTED
     if MOVING:
@@ -38,23 +41,27 @@ def stop_motors():
         rospy.logwarn("🛑 로봇 정지!")
         arduino.write(command.encode())
         MOVING = False
-        OBSTACLE_DETECTED = True
+    OBSTACLE_DETECTED = True
 
-# 🚀 모터 주행 함수: 0.3m/s로 이동 (오른쪽 바퀴는 양수, 왼쪽 바퀴는 음수)
+# 🚀 전진 명령 함수
 def move_forward():
-    global MOVING, OBSTACLE_DETECTED
+    global MOVING, OBSTACLE_DETECTED, avoidance_mode
     if not MOVING and not OBSTACLE_DETECTED:
-        WHEEL_RADIUS = 0.135  # m
-        CONVERSION_FACTOR = 60.0 / (2 * 3.141592653589793 * WHEEL_RADIUS)
-        speed = int(DEFAULT_SPEED * CONVERSION_FACTOR)
-        command = f"mvc={speed},{-speed}\r\n"
-        rospy.loginfo(f"🚀 이동 시작: {command.strip()}")
-        arduino.write(command.encode())
+        rospy.loginfo(f"🚀 이동 시작: {FORWARD_COMMAND.strip()}")
+        arduino.write(FORWARD_COMMAND.encode())
         MOVING = True
+        avoidance_mode = False
+
+# ↪️ 회피 명령 함수 (오른쪽으로 커브)
+def turn_right():
+    global MOVING
+    rospy.loginfo(f"↪️ 회피: 오른쪽 회전 명령: {TURN_RIGHT_COMMAND.strip()}")
+    arduino.write(TURN_RIGHT_COMMAND.encode())
+    MOVING = True
 
 # 🚧 장애물 감지 콜백 함수: /min_distance_cloud 토픽의 데이터를 이용하여 모터 제어
 def callback_obstacle(msg):
-    global MOVING, OBSTACLE_DETECTED
+    global MOVING, OBSTACLE_DETECTED, avoidance_mode, avoidance_start_time
     min_distance = float('inf')
     for point in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
         x, y, z = point[:3]
@@ -64,26 +71,34 @@ def callback_obstacle(msg):
 
     rospy.loginfo(f"📏 최소 거리: {min_distance:.2f} m")
     
-    # hysteresis 적용: 
-    if not OBSTACLE_DETECTED and min_distance < STOP_THRESHOLD:
-        rospy.logwarn(f"🚨 장애물 감지됨! (거리: {min_distance:.2f}m) → 모터 정지")
-        stop_motors()
-    elif OBSTACLE_DETECTED and min_distance > START_THRESHOLD:
-        rospy.loginfo(f"✅ 장애물 사라짐! (거리: {min_distance:.2f}m) → 모터 재시작")
-        OBSTACLE_DETECTED = False
-        move_forward()
+    # 회피 모드 진입 조건: 최소 거리가 1.0~1.2m 사이이면 회피 명령 실행
+    if OBSTACLE_MIN_DIST <= min_distance <= OBSTACLE_MAX_DIST:
+        if not avoidance_mode:
+            rospy.logwarn(f"🚨 장애물 감지됨! (거리: {min_distance:.2f}m) → 오른쪽 회전 시작")
+            avoidance_mode = True
+            OBSTACLE_DETECTED = True
+            avoidance_start_time = rospy.Time.now()
+            turn_right()
+        else:
+            if (rospy.Time.now() - avoidance_start_time).to_sec() < avoidance_duration:
+                turn_right()
+            else:
+                rospy.loginfo(f"✅ 회피 완료 → 직진 재시작 (거리: {min_distance:.2f}m)")
+                OBSTACLE_DETECTED = False
+                avoidance_mode = False
+                stop_motors()  # 정지 후 전진 재개
+                move_forward()
     else:
-        # 장애물이 없는 경우에도 계속 주행 유지
-        if not OBSTACLE_DETECTED:
+        if not avoidance_mode:
             move_forward()
 
-# 🛠 ROS 구독 설정: /min_distance_cloud 토픽 구독
+# 🛠 ROS 구독 설정
 rospy.Subscriber("/min_distance_cloud", PointCloud2, callback_obstacle)
 
 # 🛠 ROS 메인 루프 실행 (10Hz)
 rate = rospy.Rate(10)
 try:
-    move_forward()  # 프로그램 시작 시 0.3m/s 이동 시작
+    move_forward()  # 프로그램 시작 시 전진
     while not rospy.is_shutdown():
         rate.sleep()
 except KeyboardInterrupt:
