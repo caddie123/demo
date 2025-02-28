@@ -1,198 +1,180 @@
 #!/usr/bin/env python3
-
 import rospy
-import rospkg
 import numpy as np
+import math
+import pyrealsense2 as rs
 import torch
-import torch.backends.cudnn as cudnn
-from pathlib import Path
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
-from yolov5_ros.msg import BoundingBox, BoundingBoxes
-from robot_ctrl.msg import CenterAndArray, DepthandDeg
-from cv_bridge import CvBridge, CvBridgeError
-from message_filters import ApproximateTimeSynchronizer, Subscriber
-from models.common import DetectMultiBackend
-from utils.general import check_img_size, non_max_suppression, scale_boxes
-from utils.torch_utils import select_device
-from utils.augmentations import letterbox
 
-class DepthCorrection:
-    def __init__(self, horizontal_fov=56, min_depth=0.1, max_depth=10.0):
-        self.horizontal_fov = np.radians(horizontal_fov)
-        self.min_depth = min_depth
-        self.max_depth = max_depth 
+###############################################
+# 기본 파라미터 설정
+###############################################
 
-    def correct_depth(self, depth, pixel_x, image_width):
-        angle = self.calculate_angle(pixel_x, image_width)
-        correction_factor = self.get_correction_factor(angle)
-        corrected_depth = depth * correction_factor
-        corrected_depth = np.clip(corrected_depth, self.min_depth, self.max_depth)
-        return corrected_depth
+# 카메라 및 YOLO 파라미터
+img_width = 640
+horizontal_fov_deg = 69.4           # 카메라 수평 FOV (degree)
+horizontal_fov_rad = math.radians(horizontal_fov_deg)
 
-    def calculate_angle(self, pixel_x, image_width):
-        x_offset_from_center = pixel_x - (image_width / 2)
-        angle = (x_offset_from_center / (image_width / 2)) * 28  
-        return angle
+desired_distance = 2.0              # 사람 추종 목표 거리 (m)
+max_linear_speed = 1.0              # 최대 선속도 (m/s)
+max_angular_speed = 1.0             # 최대 회전 속도 (rad/s)
 
-    def get_correction_factor(self, angle):
-        angle_radians = np.radians(angle)
-        correction_factor = 1 / np.cos(angle_radians)
-        correction_factor = np.clip(correction_factor, 1, 1.2)
-        return correction_factor
+# LiDAR(2D LaserScan) 장애물 회피 파라미터
+obstacle_threshold = 2.0            # 장애물 인식 최대 거리 (m)
+# 전방 60° 범위: -30° ~ +30° (radian)
+scan_fov_min = -math.radians(30)
+scan_fov_max = math.radians(30)
+# 사람 각도 주변은 장애물로 인식하지 않음 (예: ±10°)
+person_ignore_tolerance = math.radians(10)
 
-class HumanFollower:
-    def __init__(self):
-        rospy.init_node('human_follower', anonymous=True)
+###############################################
+# 전역 변수
+###############################################
 
-        # Parameters
-        self.desired_distance = rospy.get_param('~desired_distance', 2.0)
-        self.stop_distance = rospy.get_param('~stop_distance', 1.0)
-        self.follow_threshold = rospy.get_param('~follow_threshold', 1.5)
-        self.max_linear_speed = rospy.get_param('~max_linear_speed', 0.4)
-        self.max_angular_speed = rospy.get_param('~max_angular_speed', 1.0)
-        self.angular_scale = rospy.get_param('~angular_scale', 0.01)
+# 최근 LaserScan 데이터를 저장
+latest_scan = None
+# 사람이 검출되었을 때, 해당 사람의 각도 (라디안)
+person_angle = None
 
-        # YOLOv5 Parameters
-        rospack = rospkg.RosPack()
-        yolov5_path = rospack.get_path('yolov5_ros') + '/src/yolov5'
-        weights = rospy.get_param("~weights", yolov5_path + '/weights/yolov5s.pt')
-        self.device = select_device(str(rospy.get_param("~device", "cpu")))
-        self.model = DetectMultiBackend(weights, device=self.device, dnn=rospy.get_param("~dnn", True))
-        self.stride, self.names = self.model.stride, self.model.names
-        self.img_size = [rospy.get_param("~inference_size_w", 640), rospy.get_param("~inference_size_h", 480)]
-        self.img_size = check_img_size(self.img_size, s=self.stride)
-        cudnn.benchmark = True
-        self.model.warmup(imgsz=(1, 3, *self.img_size))
+###############################################
+# RealSense와 YOLO 초기화
+###############################################
 
-        self.depth_correction = DepthCorrection(horizontal_fov=56)
+# RealSense 파이프라인 설정 (컬러 + 깊이)
+pipeline = rs.pipeline()
+config = rs.config()
+config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+pipeline.start(config)
 
-        # Subscribers
-        self.image_sub = Subscriber('/camera/color/image_raw', Image)
-        self.depth_sub = Subscriber('/camera/depth/image_raw', Image)
-        self.ts = ApproximateTimeSynchronizer([self.image_sub, self.depth_sub], queue_size=10, slop=0.1)
-        self.ts.registerCallback(self.sync_callback)
+align_to = rs.stream.color
+align = rs.align(align_to)
 
-        # Publisher
-        self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
+# YOLOv5 모델 로드 (pretrained 모델 사용)
+rospy.loginfo("Loading YOLOv5 model...")
+model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+model.conf = 0.5
+PERSON_CLASS_ID = 0
 
-        self.bridge = CvBridge()
-        self.person_detected = False
-        self.is_following = False
+###############################################
+# LaserScan 콜백 함수 (2D LiDAR 데이터)
+###############################################
 
-    def sync_callback(self, img_msg, depth_msg):
-        detected_persons = self.detect_person(img_msg)
-        if not detected_persons:
-            rospy.logwarn("No persons detected.")
-            self.person_detected = False
-            return
+def scan_callback(scan_msg):
+    global latest_scan
+    latest_scan = scan_msg
+    # (필요시 디버깅 로그 출력)
+    rospy.loginfo_throttle(5, "Received LaserScan with %d points", len(scan_msg.ranges))
 
-        closest_depth = None
-        closest_degree = None
-        for person in detected_persons:
-            xc, yc, x = person
-            center_depth, avg_x = self.get_min_depth(depth_msg, x, yc, xc)
-            if center_depth is not None and avg_x is not None:
-                if closest_depth is None or center_depth < closest_depth:
-                    degree = self.depth_correction.calculate_angle(xc, self.img_size[0])
-                    corrected_depth = self.depth_correction.correct_depth(center_depth, xc, self.img_size[0])
-                    closest_depth = corrected_depth
-                    closest_degree = degree
+###############################################
+# 장애물 회피 벡터 계산 함수 (전방 60°만 처리)
+###############################################
 
-        if closest_depth is not None and closest_degree is not None:
-            self.person_detected = True
-            self.update_follow_state(closest_depth)
-            self.follow_person(closest_depth, closest_degree)
-        else:
-            rospy.logwarn("No valid depth found for any detected person.")
+def compute_avoidance_vector(scan_msg, person_ang):
+    """
+    LaserScan 데이터를 기반으로 장애물 회피 벡터를 계산합니다.
+    - 전방 60° 범위 (scan_fov_min ~ scan_fov_max) 내의 점만 처리.
+    - 각 스캔 포인트 중, 측정값이 obstacle_threshold 이하이면,
+      (1 - distance/obstacle_threshold) 가중치를 적용해 회피 벡터를 누적합니다.
+    - 만약 해당 스캔 각도가 검출된 사람(person_ang) 주변(person_ignore_tolerance)이라면 무시합니다.
+    """
+    avoidance = np.array([0.0, 0.0])
+    if scan_msg is None:
+        return avoidance
 
-    def detect_person(self, img_msg):
-        try:
-            img_cv = self.bridge.imgmsg_to_cv2(img_msg, "bgr8")
-        except CvBridgeError as e:
-            rospy.logerr(f"CvBridge Error: {e}")
-            return []
+    angle = scan_msg.angle_min
+    for r in scan_msg.ranges:
+        # 유효한 측정값 확인 및 전방 60° 범위 내인지 확인
+        if np.isfinite(r) and r < obstacle_threshold and (angle >= scan_fov_min and angle <= scan_fov_max):
+            # 만약 사람이 검출되었고, 이 각도가 사람 각도와 가까우면 무시
+            if person_ang is not None and abs(angle - person_ang) < person_ignore_tolerance:
+                pass  # 사람은 장애물로 인식하지 않음
+            else:
+                # 가까울수록 가중치 높음
+                weight = 1 - (r / obstacle_threshold)
+                # 회피 벡터는 장애물 반대 방향 (즉, -cos(angle), -sin(angle))
+                avoidance += np.array([-np.cos(angle), -np.sin(angle)]) * weight
+        angle += scan_msg.angle_increment
+    return avoidance
 
-        im, im0 = self.preprocess(img_cv)
-        im = torch.from_numpy(im).to(self.device)
-        im = im.float() / 255.0
-        if len(im.shape) == 3:
-            im = im[None]
+###############################################
+# 메인 함수
+###############################################
 
-        pred = self.model(im, augment=False, visualize=False)
-        pred = non_max_suppression(pred, 0.75, 0.45, classes=[0], max_det=1000)
+def main():
+    rospy.init_node("human_follower_2d")
+    cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+    rospy.Subscriber("/scan", LaserScan, scan_callback)
 
-        detected_persons = []
-        if pred[0] is not None and len(pred[0]):
-            pred[0][:, :4] = scale_boxes(im.shape[2:], pred[0][:, :4], im0.shape).round()
-            for *xyxy, conf, cls in reversed(pred[0]):
-                if self.names[int(cls)] == 'person':
-                    xc = int((xyxy[0] + xyxy[2]) / 2)
-                    yc = int((xyxy[1] + xyxy[3]) / 2)
-                    x = [i for i in range(int(xyxy[0]) + 1, int(xyxy[2]))]
-                    detected_persons.append((xc, yc, x))
-        return detected_persons
-
-    def preprocess(self, img):
-        img0 = img.copy()
-        img = np.array([letterbox(img, self.img_size, stride=self.stride, auto=True)[0]])
-        img = img[..., ::-1].transpose((0, 3, 1, 2))  # BGR to RGB, BHWC to BCHW
-        img = np.ascontiguousarray(img)
-        return img, img0 
-
-    def get_min_depth(self, depth_msg, x, yc, xc):
-        try:
-            depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
-        except CvBridgeError as e:
-            rospy.logerr(f"CvBridge Error: {e}")
-            return None, None
-
-        depth_array = np.array(depth_image, dtype=np.float32)
-        if yc >= depth_array.shape[0]:
-            return None, None
-
-        valid_depths_and_x = [(depth_array[yc, xi], xi) for xi in x if xi < depth_array.shape[1] and depth_array[yc, xi] > 0]
-
-        if valid_depths_and_x:
-            _min_depth, min_x = min(valid_depths_and_x, key=lambda t: t[0])
-            avg_x = xc
-            min_depth = round(_min_depth / 1000, 1)
-            return min_depth, avg_x
-        else:
-            return None, None
-
-    def update_follow_state(self, distance):
-        if distance <= self.stop_distance:
-            self.is_following = False
-        elif distance >= self.follow_threshold:
-            self.is_following = True
-
-    def follow_person(self, distance, angle_deg):
-        twist = Twist()
-        if self.is_following and distance > self.desired_distance:
-            twist.linear.x = min(self.max_linear_speed, 0.5 * (distance - self.desired_distance))
-        else:
-            twist.linear.x = 0.0
-
-        angle_rad = angle_deg * np.pi / 180
-        twist.angular.z = max(-self.max_angular_speed, min(self.max_angular_speed, angle_rad * self.angular_scale))
-
-        self.cmd_vel_pub.publish(twist)
-        rospy.loginfo(f"Published cmd_vel: linear.x={twist.linear.x:.2f}, angular.z={twist.angular.z:.2f}")
-
-    def run(self):
-        rate = rospy.Rate(10)
+    rate = rospy.Rate(10)  # 10 Hz
+    try:
         while not rospy.is_shutdown():
-            if not self.person_detected:
-                twist = Twist()
-                self.cmd_vel_pub.publish(twist)
-                rospy.logwarn("No person detected. Robot is stopping.")
-            self.person_detected = False
+            # RealSense 프레임 받기
+            frames = pipeline.wait_for_frames()
+            aligned_frames = align.process(frames)
+            color_frame = aligned_frames.get_color_frame()
+            depth_frame = aligned_frames.get_depth_frame()
+            if not color_frame or not depth_frame:
+                continue
+
+            color_image = np.asanyarray(color_frame.get_data())
+            # YOLO로 사람 검출
+            results = model(color_image)
+            detections = results.xyxy[0].cpu().numpy()
+
+            twist = Twist()
+            target_vector = np.array([0.0, 0.0])
+            global person_angle
+            person_angle = None  # 초기화
+
+            person_detected = False
+            for *box, conf, cls in detections:
+                if int(cls) == PERSON_CLASS_ID:
+                    # 첫 번째 사람 검출만 처리
+                    x1, y1, x2, y2 = map(int, box)
+                    center_x = int((x1 + x2) / 2)
+                    center_y = int((y1 + y2) / 2)
+                    depth_val = depth_frame.get_distance(center_x, center_y)
+                    # 카메라 중심 기준으로 각도 계산
+                    # (이미지 중심이 0°라 가정, horizontal_fov_deg 분포)
+                    angle_deg = (center_x - (img_width / 2)) * (horizontal_fov_deg / img_width)
+                    person_angle = math.radians(angle_deg)
+                    rospy.loginfo("Person detected: center=(%d,%d), depth=%.2f m, angle=%.1f°",
+                                  center_x, center_y, depth_val, angle_deg)
+                    # 목표 벡터: 사람과의 거리 오차를 바탕으로, 그 방향으로 이동하도록
+                    error = depth_val - desired_distance
+                    target_vector = error * np.array([np.cos(person_angle), np.sin(person_angle)])
+                    person_detected = True
+                    break
+
+            # 장애물 회피 벡터 계산 (전방 60°만 처리)
+            avoidance_vector = compute_avoidance_vector(latest_scan, person_angle if person_detected else None)
+
+            # 최종 명령 벡터: 목표 추종 벡터 + 장애물 회피 벡터
+            combined_vector = target_vector + avoidance_vector
+            norm = np.linalg.norm(combined_vector)
+            if norm > 0:
+                normalized_vector = combined_vector / norm
+            else:
+                normalized_vector = np.array([0.0, 0.0])
+
+            # 간단한 속도 매핑: X 성분 → 선속도, Y 성분 → 각속도 (회전 각속도는 arctan2로 계산)
+            linear_vel = np.clip(np.dot(normalized_vector, np.array([1, 0])), 0, max_linear_speed)
+            angular_vel = np.clip(np.arctan2(normalized_vector[1], normalized_vector[0]),
+                                  -max_angular_speed, max_angular_speed)
+            twist.linear.x = linear_vel
+            twist.angular.z = angular_vel
+
+            rospy.loginfo("Publishing cmd_vel: linear=%.2f, angular=%.2f", linear_vel, angular_vel)
+            cmd_pub.publish(twist)
             rate.sleep()
 
+    except Exception as e:
+        rospy.logerr("Exception: %s", e)
+    finally:
+        pipeline.stop()
+
 if __name__ == '__main__':
-    try:
-        follower = HumanFollower()
-        follower.run()
-    except rospy.ROSInterruptException:
-        pass
+    main()
+
